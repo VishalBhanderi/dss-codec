@@ -528,15 +528,11 @@ Total: 52 + 252 + 24 = 328 bits = 41 bytes
 excitation[294]:     i64   // Excitation history (288 + 6 overlap for sinc filter)
 history[187]:        i64   // Pitch prediction buffer
 working_buffer[4][72]: i64 // Per-subframe output before resampling
-audio_buf[15]:       i64   // LPC synthesis filter state (shift_sq_add)
-err_buf1[15]:        i64   // Error correction filter state (shift_sq_sub, UNC)
-err_buf2[15]:        i64   // Error correction filter state (shift_sq_sub, first pass)
 lpc_filter[14]:      i64   // Raw reflection coefficients from codebook
-filter[15]:          i64   // LPC polynomial coefficients (from Levinson)
 vector_buf[72]:      i64   // Working buffer for current subframe
-noise_state:         i64   // PRNG state for noise modulation
+lattice_state[14]:   i64   // Backward-prediction delays of the lattice filter
+deemph_state:        i64   // y[n-1] of the de-emphasis post-filter
 pulse_dec_mode:      bool  // Pulse decoding mode flag
-shift_amount:        i32   // 0 or 1, set by overflow detection in Levinson
 ```
 
 ### Processing Pipeline
@@ -566,39 +562,11 @@ for i in 0..14:
     lpc_filter[i] = FILTER_CB[i][filter_idx[i]]
 ```
 
-#### Step 3: Convert Coefficients — Levinson Recursion (`_convert_coeffs`)
+#### Step 3: No Coefficient Conversion
 
-Convert reflection coefficients to LPC polynomial coefficients using the Levinson-Durbin algorithm with overflow detection:
-
-```
-shift_amount = 0
-filter[0] = 0x2000   // Q13 unity
-
-for a in 0..14:
-    filter[a+1] = lpc_filter[a] >> 2
-
-    for i in 1..=(a+1)/2:
-        coeff_1 = filter[i]
-        coeff_2 = filter[a+1-i]
-        tmp1 = formula(coeff_1, lpc_filter[a], coeff_2)
-        tmp2 = formula(coeff_2, lpc_filter[a], coeff_1)
-
-        if tmp1 or tmp2 overflow [-32768, 32767]:
-            overflow = true
-
-        filter[i] = clip16(tmp1)
-        filter[a+1-i] = clip16(tmp2)
-
-if overflow:
-    // Restart with halved precision
-    shift_amount = 1
-    filter[0] = 0x1000
-    // Repeat loop with >> 3 instead of >> 2, no overflow check
-```
-
-Where `formula(a, b, c) = (a * 32768 + b * c + 16384) >> 15`.
-
-The `shift_amount` flag (0 or 1) controls the shift value used in all subsequent filter operations: `shift = 13 - shift_amount`.
+The reflection coefficients are fed to the lattice synthesis filter as they come
+out of the codebook. There is no Levinson recursion and no LPC polynomial: the
+lattice is driven by the k values directly, which is what DssDecoder.dll does.
 
 #### Step 4: Per-Subframe Processing
 
@@ -642,76 +610,44 @@ for i in 0..72:
     history[72 - i] = vector_buf[i]
 ```
 
-**4d. First Error Correction Filter (`_shift_sq_sub` with err_buf2)**
+**4d. Lattice Synthesis Filter**
+
+A 14-stage lattice implementation of 1/A(z), in Burg form, driven by the raw
+reflection coefficients:
 
 ```
-shift = 13 - shift_amount
-for a in 0..72:
-    tmp = vector_buf[a] * filter[0]
-    for i in 14 downto 1:
-        tmp -= err_buf2[i] * filter[i]
-    shift err_buf2 right by 1
-    tmp = (tmp + 4096) >> shift
-    err_buf2[1] = clip32767(tmp)
-    vector_buf[a] = clip32767(tmp)
+for each sample n in 0..72:
+    f = vector_buf[n] - ((k[13] * state[13]) >> 15)
+    for i in 12 downto 0:
+        f_new = f - ((k[i] * state[i]) >> 15)
+        state[i+1] = state[i] + ((k[i] * f_new) >> 15)
+        f = f_new
+    state[0] = f
+    vector_buf[n] = f
 ```
 
-**4e. Noise Modulation Synthesis (`_sf_synthesis`)**
+The lattice state persists across subframes and frames. A lattice with
+`|k| < 1` is unconditionally stable, which is why this structure cannot drift
+into the resonance the direct form could reach on long recordings.
 
-This is the most complex step, involving:
+**4e. Gain Control**
 
-1. **Energy measurement**: `vsum_1 = sum(|vector_buf[i]|)`, clamped to 0xFFFFF
+The reflection-coefficient tables differ from the DLL's by a few percent, which
+leaves a small energy bias. Cap the subframe RMS so it cannot build up:
 
-2. **Normalization**: Find leading zeros of max(|vector_buf|) to determine normalize_bits. Scale vector_buf up by `normalize_bits - 3`, scale audio_buf and err_buf1 up by `normalize_bits`.
+```
+rms = isqrt(sum(vector_buf[i]^2) / 72)
+if rms > 6000:
+    scale = (6000 << 15) / rms
+    for i in 0..72:
+        vector_buf[i] = (vector_buf[i] * scale) >> 15
 
-3. **LPC Synthesis filter** (`_shift_sq_add` with BINARY_DECREASING):
-   ```
-   tmp_buf[i] = (filter[i] * BINARY_DECREASING[i] + 0x4000) >> 15
-   for each sample:
-       audio_buf[0] = vector_buf[a]
-       tmp = sum(audio_buf[i] * tmp_buf[i])
-       shift audio_buf right
-       vector_buf[a] = clip32767((tmp + 4096) >> shift)
-   ```
-
-4. **Error correction filter** (`_shift_sq_sub` with UNC_DECREASING):
-   ```
-   tmp_buf[i] = (filter[i] * UNC_DECREASING[i] + 0x4000) >> 15
-   for each sample:
-       tmp = vector_buf[a] * tmp_buf[0]
-       tmp -= sum(err_buf1[i] * tmp_buf[i])
-       shift err_buf1 right
-       err_buf1[1] = clip32767((tmp + 4096) >> shift)
-       vector_buf[a] = clip32767((tmp + 4096) >> shift)
-   ```
-
-5. **Noise modulation LPC**:
-   ```
-   lf = min(0, lpc_filter[0] >> 1)
-   for i in 71 downto 1:
-       vector_buf[i] = clip32767(formula(vector_buf[i], lf, vector_buf[i-1]))
-   vector_buf[0] = clip32767(formula(vector_buf[0], lf, prev_err_buf1[1]))
-   ```
-
-6. **Scale down**: Reverse the normalization scaling.
-
-7. **Energy ratio and PRNG noise**:
-   ```
-   vsum_2 = sum(|vector_buf[i]|)
-   t = (vsum_1 << 11) / max(vsum_2, 0x40)
-   bias = ((409 * t) >> 15) << 15
-
-   noise[0] = clip32767((bias + 32358 * noise_state) >> 15)
-   for i in 1..72:
-       noise[i] = clip32767((bias + 32358 * noise[i-1]) >> 15)
-   noise_state = noise[71]
-
-   working_buffer[sf][i] = clip32767((vector_buf[i] * noise[i]) >> 11)
-   ```
+working_buffer[sf][i] = vector_buf[i]
+```
 
 #### Step 5: Sinc Resampling — 12000 to 11025 Hz (`_update_state`)
 
-The 288 working samples (4 subframes x 72) are resampled to 264 output samples using an 11:12 ratio polyphase sinc interpolation filter with 67 coefficients:
+The 288 working samples (4 subframes x 72) are resampled to 264 output samples using an 11:12 ratio polyphase sinc interpolation filter with 67 coefficients. Each resampled sample then passes through a first-order de-emphasis post-filter, `y[n] = x[n] + 0.1 * y[n-1]` (0.1 is 3277 in Q15), before the final clip to 16 bits:
 
 ```
 // Copy working buffer into excitation (with 6-sample overlap from previous frame)
@@ -1439,7 +1375,7 @@ dss-codec/
     codec/
       mod.rs               # Module declarations
       common.rs            # Shared: comb(), combinatorial decode, combined pitch, lattice synthesis
-      dss_sp.rs            # DSS SP: Q15 integer, Levinson, sinc resample
+      dss_sp.rs            # DSS SP: Q15 integer, lattice, de-emphasis, sinc resample
       ds2_sp.rs            # DS2 SP: f64, lattice synthesis
       ds2_qp.rs            # DS2 QP: f64, lattice, de-emphasis
     tables/
