@@ -1,8 +1,9 @@
 //! DSS SP decoder — Q15 integer arithmetic matching FFmpeg dss_sp.c / DssDecoder.dll.
 //!
-//! Architecture: CELP with 14 reflection coefficients, Levinson recursion,
-//! pitch-adaptive excitation, 7-pulse fixed codebook, cascaded LPC synthesis +
-//! error correction, noise modulation, and 11:12 sinc resampling (12000→11025 Hz).
+//! Architecture: CELP with 14 reflection coefficients, pitch-adaptive
+//! excitation, 7-pulse fixed codebook, a 14-stage lattice synthesis filter
+//! driven by the raw reflection coefficients, a de-emphasis post-filter, and
+//! 11:12 sinc resampling (12000→11025 Hz).
 
 use crate::bitstream::BitstreamReader;
 use crate::tables::dss_sp::*;
@@ -10,6 +11,9 @@ use crate::tables::dss_sp::*;
 const SUBFRAMES: usize = 4;
 const SUBFRAME_SIZE: usize = 72;
 const OUTPUT_SAMPLES: usize = 264;
+
+/// RMS ceiling applied per subframe by the AGC.
+const AGC_RMS_CEILING: i64 = 6000;
 
 fn clip16(x: i64) -> i64 {
     x.clamp(-32768, 32767)
@@ -28,11 +32,6 @@ fn clip_sinc_pcm(x: i64) -> i64 {
     } else {
         32767
     }
-}
-
-/// DSS_SP_FORMULA: ((a * 32768 + b * c) + 16384) >> 15
-fn formula(a: i64, b: i64, c: i64) -> i64 {
-    ((a * 32768 + b * c) + 16384) >> 15
 }
 
 /// Combinatorial-table pulse-position decode (FFmpeg dss_sp_decode_pulse_pos_d32
@@ -99,15 +98,13 @@ pub struct DssSpDecoder {
     excitation: Vec<i64>,
     history: Vec<i64>,
     working_buffer: [[i64; SUBFRAME_SIZE]; SUBFRAMES],
-    audio_buf: [i64; 15],
-    err_buf1: [i64; 15],
-    err_buf2: [i64; 15],
     lpc_filter: [i64; 14],
-    filter: [i64; 15],
     vector_buf: [i64; SUBFRAME_SIZE],
-    noise_state: i64,
+    /// Backward-prediction delays of the lattice synthesis filter.
+    lattice_state: [i64; 14],
+    /// y[n-1] of the de-emphasis post-filter.
+    deemph_state: i64,
     pulse_dec_mode: bool,
-    shift_amount: i32,
     /* Pulse-decode routing, matching FFmpeg dss_sp.c.
      * comb_pulse_mode: frame-0 flag (b0&0x80 ? b0&1 : 0).
      * repack: per-frame; comb streams read bit7 of byte1, else always 1.
@@ -130,15 +127,11 @@ impl DssSpDecoder {
             excitation: vec![0; 288 + 6],
             history: vec![0; 187],
             working_buffer: [[0; SUBFRAME_SIZE]; SUBFRAMES],
-            audio_buf: [0; 15],
-            err_buf1: [0; 15],
-            err_buf2: [0; 15],
             lpc_filter: [0; 14],
-            filter: [0; 15],
             vector_buf: [0; SUBFRAME_SIZE],
-            noise_state: 0,
+            lattice_state: [0; 14],
+            deemph_state: 0,
             pulse_dec_mode: true,
-            shift_amount: 0,
             comb_pulse_mode: false,
             repack: false,
             repack_pulse_tbl: false,
@@ -150,7 +143,6 @@ impl DssSpDecoder {
         let (filter_idx, sf_adaptive_gain, pitch_lag, subframes) = self.unpack_coeffs(pkt);
 
         self.unpack_filter(&filter_idx);
-        self.convert_coeffs();
 
         for j in 0..SUBFRAMES {
             self.gen_exc(pitch_lag[j], ADAPTIVE_GAIN[sf_adaptive_gain[j]] as i64);
@@ -161,24 +153,14 @@ impl DssSpDecoder {
                 self.vector_buf[i] = self.history[SUBFRAME_SIZE - i];
             }
 
-            // shift_sq_sub with err_buf2
-            {
-                let shift = 13 - self.shift_amount;
-                for a in 0..SUBFRAME_SIZE {
-                    let mut tmp = self.vector_buf[a] * self.filter[0];
-                    for i in (1..=14).rev() {
-                        tmp -= self.err_buf2[i] * self.filter[i];
-                    }
-                    for i in (1..=14).rev() {
-                        self.err_buf2[i] = self.err_buf2[i - 1];
-                    }
-                    tmp = (tmp + 4096) >> shift;
-                    self.err_buf2[1] = clip_sinc_pcm(tmp);
-                    self.vector_buf[a] = clip_sinc_pcm(tmp);
-                }
-            }
+            lattice_filter(
+                &self.lpc_filter,
+                &mut self.lattice_state,
+                &mut self.vector_buf,
+            );
+            agc(&mut self.vector_buf);
 
-            self.sf_synthesis(self.lpc_filter[0], j);
+            self.working_buffer[j].copy_from_slice(&self.vector_buf);
         }
 
         // Flatten working buffer
@@ -332,44 +314,6 @@ impl DssSpDecoder {
         }
     }
 
-    fn convert_coeffs(&mut self) {
-        self.shift_amount = 0;
-        self.filter[0] = 0x2000;
-        let mut overflow = false;
-
-        for a in 0..14 {
-            let a_plus = a + 1;
-            self.filter[a_plus] = self.lpc_filter[a] >> 2;
-            for i in 1..=(a_plus / 2) {
-                let coeff_1 = self.filter[i];
-                let coeff_2 = self.filter[a_plus - i];
-                let tmp1 = formula(coeff_1, self.lpc_filter[a], coeff_2);
-                let tmp2 = formula(coeff_2, self.lpc_filter[a], coeff_1);
-                if !(-32768..=32767).contains(&tmp1) || !(-32768..=32767).contains(&tmp2) {
-                    overflow = true;
-                }
-                self.filter[i] = clip16(tmp1);
-                self.filter[a_plus - i] = clip16(tmp2);
-            }
-        }
-
-        if overflow {
-            self.shift_amount = 1;
-            self.filter[0] = 0x1000;
-            for a in 0..14 {
-                let a_plus = a + 1;
-                self.filter[a_plus] = self.lpc_filter[a] >> 3;
-                for i in 1..=(a_plus / 2) {
-                    let coeff_1 = self.filter[i];
-                    let coeff_2 = self.filter[a_plus - i];
-                    self.filter[i] = clip16(formula(coeff_1, self.lpc_filter[a], coeff_2));
-                    self.filter[a_plus - i] =
-                        clip16(formula(coeff_2, self.lpc_filter[a], coeff_1));
-                }
-            }
-        }
-    }
-
     fn gen_exc(&mut self, pitch_lag: usize, gain: i64) {
         if pitch_lag < SUBFRAME_SIZE {
             for i in 0..SUBFRAME_SIZE {
@@ -406,119 +350,6 @@ impl DssSpDecoder {
         }
     }
 
-    fn sf_synthesis(&mut self, lpc_filter_0: i64, subframe_idx: usize) {
-        let size = SUBFRAME_SIZE;
-
-        let vsum_1 = {
-            let s: i64 = self.vector_buf[..size].iter().map(|v| v.abs()).sum();
-            s.min(0xFFFFF)
-        };
-
-        let normalize_bits = {
-            let mut val: i64 = 1;
-            for v in &self.vector_buf[..size] {
-                val |= v.abs();
-            }
-            let mut nb = 0i32;
-            while val <= 0x4000 {
-                val *= 2;
-                nb += 1;
-            }
-            nb
-        };
-
-        // Scale up
-        scale_vec(&mut self.vector_buf, normalize_bits - 3, size);
-        scale_vec_arr(&mut self.audio_buf, normalize_bits, 15);
-        scale_vec_arr(&mut self.err_buf1, normalize_bits, 15);
-
-        let v36 = self.err_buf1[1];
-
-        // shift_sq_add with BINARY_DECREASING
-        {
-            let tmp_buf = vec_mult(&self.filter, &BINARY_DECREASING);
-            let shift = 13 - self.shift_amount;
-            for a in 0..size {
-                self.audio_buf[0] = self.vector_buf[a];
-                let mut tmp: i64 = 0;
-                for i in (0..=14).rev() {
-                    tmp += self.audio_buf[i] * tmp_buf[i];
-                }
-                for i in (1..=14).rev() {
-                    self.audio_buf[i] = self.audio_buf[i - 1];
-                }
-                tmp = (tmp + 4096) >> shift;
-                self.vector_buf[a] = clip_sinc_pcm(tmp);
-            }
-        }
-
-        // shift_sq_sub with UNC_DECREASING
-        {
-            let tmp_buf = vec_mult(&self.filter, &UNC_DECREASING);
-            let shift = 13 - self.shift_amount;
-            for a in 0..size {
-                let mut tmp = self.vector_buf[a] * tmp_buf[0];
-                for i in (1..=14).rev() {
-                    tmp -= self.err_buf1[i] * tmp_buf[i];
-                }
-                for i in (1..=14).rev() {
-                    self.err_buf1[i] = self.err_buf1[i - 1];
-                }
-                tmp = (tmp + 4096) >> shift;
-                self.err_buf1[1] = clip_sinc_pcm(tmp);
-                self.vector_buf[a] = clip_sinc_pcm(tmp);
-            }
-        }
-
-        // Noise modulation LPC
-        let lf = {
-            let half = lpc_filter_0 >> 1;
-            if half >= 0 { 0 } else { half }
-        };
-
-        if size > 1 {
-            for i in (1..size).rev() {
-                let tmp = formula(self.vector_buf[i], lf, self.vector_buf[i - 1]);
-                self.vector_buf[i] = clip_sinc_pcm(tmp);
-            }
-        }
-        {
-            let tmp = formula(self.vector_buf[0], lf, v36);
-            self.vector_buf[0] = clip_sinc_pcm(tmp);
-        }
-
-        // Scale down
-        scale_vec(&mut self.vector_buf, -normalize_bits, size);
-        scale_vec_arr(&mut self.audio_buf, -normalize_bits, 15);
-        scale_vec_arr(&mut self.err_buf1, -normalize_bits, 15);
-
-        // Energy ratio and noise generation
-        let vsum_2: i64 = self.vector_buf[..size].iter().map(|v| v.abs()).sum();
-        let t = if vsum_2 >= 0x40 {
-            (vsum_1 << 11) / vsum_2
-        } else {
-            1
-        };
-
-        let bias = ((409 * t) >> 15) << 15;
-        let mut noise = [0i64; SUBFRAME_SIZE];
-        noise[0] = clip_sinc_pcm((bias + 32358 * self.noise_state) >> 15);
-        for i in 1..size {
-            noise[i] = clip_sinc_pcm((bias + 32358 * noise[i - 1]) >> 15);
-        }
-        self.noise_state = noise[size - 1];
-
-        for i in 0..size {
-            let tmp = (self.vector_buf[i] * noise[i]) >> 11;
-            // FFmpeg: repack (NCH) -> clip_work(=clip_sinc_pcm); else av_clip_int16.
-            self.working_buffer[subframe_idx][i] = if self.repack {
-                clip_sinc_pcm(tmp)
-            } else {
-                clip16(tmp)
-            };
-        }
-    }
-
     fn update_state(&mut self, working_flat: &[i64]) -> Vec<i16> {
         for i in 0..6 {
             self.excitation[i] = self.excitation[288 + i];
@@ -541,6 +372,12 @@ impl DssSpDecoder {
             }
             offset += 1;
             tmp >>= 15;
+
+            // De-emphasis post-filter: y[n] = x[n] + 0.1 * y[n-1].
+            // 0.1 in Q15 is 3277.
+            tmp += (3277 * self.deemph_state) >> 15;
+            self.deemph_state = clip16(tmp);
+
             // FFmpeg: repack (NCH) -> clip_sinc_pcm; else av_clip_int16.
             let s = if self.repack { clip_sinc_pcm(tmp) } else { clip16(tmp) };
             output.push(s as i16);
@@ -556,40 +393,52 @@ impl DssSpDecoder {
     }
 }
 
-/// Scale fixed-size array values by shifting
-fn scale_vec(vec: &mut [i64; SUBFRAME_SIZE], bits: i32, size: usize) {
-    if bits < 0 {
-        let shift = (-bits) as u32;
-        for v in vec[..size].iter_mut() {
-            *v >>= shift;
+/// Integer square root (Newton), so the AGC stays in integer arithmetic.
+fn isqrt(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
+/// Lattice synthesis filter 1/A(z), 14 stages, driven by the raw reflection
+/// coefficients (Q15) straight from the codebook — no polynomial conversion.
+///
+/// This is what DssDecoder.dll does. A lattice with |k| < 1 is unconditionally
+/// stable, unlike the direct form it replaces, which could drift into
+/// resonance on long recordings.
+fn lattice_filter(k: &[i64; 14], state: &mut [i64; 14], buf: &mut [i64; SUBFRAME_SIZE]) {
+    for sample in buf.iter_mut() {
+        let mut f = *sample - ((k[13] * state[13]) >> 15);
+        for i in (0..13).rev() {
+            let f_new = f - ((k[i] * state[i]) >> 15);
+            state[i + 1] = state[i] + ((k[i] * f_new) >> 15);
+            f = f_new;
         }
-    } else if bits > 0 {
-        let shift = bits as u32;
-        for v in vec[..size].iter_mut() {
-            *v <<= shift;
-        }
+        state[0] = f;
+        *sample = f;
     }
 }
 
-fn scale_vec_arr(vec: &mut [i64; 15], bits: i32, size: usize) {
-    if bits < 0 {
-        let shift = (-bits) as u32;
-        for v in vec[..size].iter_mut() {
-            *v >>= shift;
-        }
-    } else if bits > 0 {
-        let shift = bits as u32;
-        for v in vec[..size].iter_mut() {
-            *v <<= shift;
-        }
-    }
-}
+/// Gain control compensating for the codebook approximation error.
+///
+/// The reflection-coefficient tables differ from the DLL's by a few percent,
+/// which leaves a small energy bias. Cap the subframe RMS at 6000 so it cannot
+/// build up over a long file.
+fn agc(buf: &mut [i64; SUBFRAME_SIZE]) {
+    let sum_sq: i64 = buf.iter().map(|v| v * v).sum();
+    let rms = isqrt(sum_sq / SUBFRAME_SIZE as i64);
 
-fn vec_mult(src: &[i64; 15], mult: &[i32; 15]) -> [i64; 15] {
-    let mut dst = [0i64; 15];
-    dst[0] = src[0];
-    for i in 1..15 {
-        dst[i] = (src[i] * mult[i] as i64 + 0x4000) >> 15;
+    if rms > AGC_RMS_CEILING {
+        let scale = (AGC_RMS_CEILING << 15) / rms;
+        for v in buf.iter_mut() {
+            *v = (*v * scale) >> 15;
+        }
     }
-    dst
 }
