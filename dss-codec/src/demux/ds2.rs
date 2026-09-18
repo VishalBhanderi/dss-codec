@@ -27,6 +27,19 @@ pub struct Ds2Qp7Segment {
     pub reset_before: bool,
 }
 
+/// True when `bytes` starts with the magic of an unencrypted DS2 container.
+///
+/// The leading byte differs between recorder firmware generations; every
+/// variant here uses the same `ds2` tag and block layout. `\x07` and `\x08`
+/// files also carry a variable-length header before the first audio block,
+/// which [`detect_ds2_audio_start`] locates by scanning.
+pub(crate) fn is_plain_ds2_magic(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.get(..4),
+        Some(b"\x01ds2") | Some(b"\x03ds2") | Some(b"\x07ds2") | Some(b"\x08ds2")
+    )
+}
+
 pub(crate) fn is_ds2_audio_block_header(block_header: &[u8]) -> bool {
     if block_header.len() < DS2_BLOCK_HEADER_SIZE {
         return false;
@@ -41,7 +54,7 @@ pub(crate) fn is_ds2_audio_block_header(block_header: &[u8]) -> bool {
 }
 
 pub(crate) fn detect_ds2_audio_start(data: &[u8]) -> usize {
-    if data.first().copied() != Some(0x07) {
+    if !matches!(data.first().copied(), Some(0x07) | Some(0x08)) {
         return DS2_HEADER_SIZE;
     }
 
@@ -104,7 +117,7 @@ pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
 /// For SP: frame_data is a Vec<Vec<u8>> of packets.
 /// For QP/QP7: frame data is segmented to preserve state resets at cut points.
 pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
-    if data.len() < 4 || !matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") {
+    if !is_plain_ds2_magic(data) {
         return Err(DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")));
     }
 
@@ -517,6 +530,23 @@ mod tests {
 
         data.extend_from_slice(&block);
         data
+    }
+
+    #[test]
+    fn plain_ds2_magic_accepts_every_known_firmware_generation() {
+        for lead in [0x01u8, 0x03, 0x07, 0x08] {
+            let magic = [lead, b'd', b's', b'2'];
+            assert!(is_plain_ds2_magic(&magic), "lead byte {lead:#04x}");
+        }
+    }
+
+    #[test]
+    fn plain_ds2_magic_rejects_other_containers() {
+        assert!(!is_plain_ds2_magic(b"\x02dss"));
+        assert!(!is_plain_ds2_magic(b"\x03enc"));
+        assert!(!is_plain_ds2_magic(b"\x02ds2"));
+        assert!(!is_plain_ds2_magic(b"ds2"));
+        assert!(!is_plain_ds2_magic(b""));
     }
 
     #[test]
